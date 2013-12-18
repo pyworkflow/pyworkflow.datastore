@@ -17,7 +17,7 @@ from pyworkflow.activity import *
 from pyworkflow.exceptions import UnknownActivityException, UnknownDecisionException, UnknownProcessException
 from pyworkflow.events import *
 from pyworkflow.decision import *
-from pyworkflow.process import Process
+from pyworkflow.process import *
 from pyworkflow.task import *
 from pyworkflow.signal import *
 from pyworkflow.defaults import Defaults
@@ -113,6 +113,9 @@ class DatastoreBackend(Backend):
 
     def start_process(self, process):
         # register the process
+        if not process.id:
+            process = process.copy_with_id(str(uuid4()))
+
         managed_process = {'pid': process.id, 'proc': process}
         self._save_managed_process(managed_process)
 
@@ -194,11 +197,18 @@ class DatastoreBackend(Backend):
                     self.datastore.delete(self.KEY_RUNNING_PROCESSES.child(mp['pid']))
                 self._cancel_decision(managed_process)
                 if managed_process['proc'].parent:
-                    self._schedule_decision(self._managed_process(managed_process['proc'].parent))
+                    parent = self._managed_process(managed_process['proc'].parent)
+                    if decision.type == 'complete_process':
+                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCompleted(result=decision.result)))
+                    elif decision.type == 'cancel_process':
+                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details, reason=decision.reason)))
+
+                    self._save_managed_process(parent)
+                    self._schedule_decision(parent)
 
             # start child process
             if isinstance(decision, StartChildProcess):
-                process = Process(workflow=decision.process.workflow, id=decision.process.id, input=decision.process.input, tags=decision.process.tags, parent=task.process.id)
+                process = Process(workflow=decision.process.workflow, id=decision.process.id or str(uuid4()), input=decision.process.input, tags=decision.process.tags, parent=task.process.id)
                 managed_process = {'pid': process.id, 'proc': process}
                 self._save_managed_process(managed_process)
                 # schedule a decision
@@ -229,6 +239,9 @@ class DatastoreBackend(Backend):
 
         # activity finished
         self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(task.context['run_id']))
+
+    def process_by_id(self, pid):
+        return self._managed_process(pid)['proc']
 
     def processes(self, workflow=None, tag=None):
         match = lambda p: (p['proc'].workflow == workflow or not workflow) and (tag in p['proc'].tags or not tag)
@@ -293,15 +306,17 @@ class DatastoreBackend(Backend):
 
         # find queued decision tasks (that haven't timed out)
         try:
-            sa = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)), key=lambda sa: sa['dt'])
-            if not sa:
+            sd = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)), key=lambda sa: sa['dt'])
+            if not sd:
                 return None
 
-            self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(sa[0]['pid']))
-            (pid, expiration) = (sa[0]['pid'], sa[0]['exp'])
+            print sd[0]
+            self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']))
+            (pid, expiration) = (sd[0]['pid'], sd[0]['exp'])
         except:
             return None
 
+        print pid
         run_id = str(uuid4())
         process = self._managed_process(pid)['proc']
         expiration = datetime.now() + timedelta(seconds=self.workflows[process.workflow]['timeout'])
