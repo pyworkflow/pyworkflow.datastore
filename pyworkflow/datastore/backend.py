@@ -84,11 +84,12 @@ class DatastoreBackend(Backend):
         for a in to_cancel:
             self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(a['run_id']))
 
-    def _schedule_decision(self, process, start=None):
+    def _schedule_decision(self, process, start=None, timer=None):
         existing = self.datastore.get(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
         if not existing:
             expiration = datetime.now() + timedelta(seconds=self.workflows[process['proc'].workflow]['decision_timeout'])
-            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), {'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start or datetime.now()})
+            timer = pickle.dumps(timer) if timer else None
+            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), {'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start, 'timer': timer})
 
     def _cancel_decision(self, process):
         self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
@@ -215,7 +216,7 @@ class DatastoreBackend(Backend):
                 self._schedule_decision(managed_process)
 
             if isinstance(decision, Timer):
-                self._schedule_decision(managed_process, start=datetime.now() + timedelta(seconds=decision.delay))
+                self._schedule_decision(managed_process, start=datetime.now() + timedelta(seconds=decision.delay), timer=decision)
         
 
         # decision finished
@@ -310,19 +311,24 @@ class DatastoreBackend(Backend):
         # find queued decision tasks (that haven't timed out)
         try:
             sd = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)), key=lambda d: d['dt'])
-            sd = filter(lambda d: d['start']<= datetime.now(), sd)
+            sd = filter(lambda d: d['start'] is None or d['start'] <= datetime.now(), sd)
             if not sd:
                 return None
 
-            print sd[0]
             self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']))
-            (pid, expiration) = (sd[0]['pid'], sd[0]['exp'])
+            (pid, expiration, timer) = (sd[0]['pid'], sd[0]['exp'], sd[0]['timer'])
         except:
             return None
 
-        print pid
         run_id = str(uuid4())
-        process = self._managed_process(pid)['proc']
+        managed_process = self._managed_process(pid)
+
+        if timer:
+            managed_process['proc'].history.append(TimerEvent(pickle.loads(timer)))
+            self._save_managed_process(managed_process)
+
+        process = managed_process['proc']
+        
         expiration = datetime.now() + timedelta(seconds=self.workflows[process.workflow]['timeout'])
         self.datastore.put(self.KEY_RUNNING_DECISIONS.child(run_id), {'run_id': run_id, 'pid': pid, 'exp': expiration})
         
