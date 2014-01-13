@@ -43,3 +43,6 @@ class DatastoreBackendTestCase(WorkflowBackendTestCase):
     
     def test_threads(self):
         self.subtest_threads()
+    
+    def test_timer(self):
+        self.subtest_timer()

@@ -84,11 +84,11 @@ class DatastoreBackend(Backend):
         for a in to_cancel:
             self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(a['run_id']))
 
-    def _schedule_decision(self, process):
+    def _schedule_decision(self, process, start=None):
         existing = self.datastore.get(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
         if not existing:
             expiration = datetime.now() + timedelta(seconds=self.workflows[process['proc'].workflow]['decision_timeout'])
-            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), {'dt': time.time(), 'pid': process['pid'], 'exp': expiration})
+            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), {'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start or datetime.now()})
 
     def _cancel_decision(self, process):
         self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
@@ -213,6 +213,9 @@ class DatastoreBackend(Backend):
                 self._save_managed_process(managed_process)
                 # schedule a decision
                 self._schedule_decision(managed_process)
+
+            if isinstance(decision, Timer):
+                self._schedule_decision(managed_process, start=datetime.now() + timedelta(seconds=decision.delay))
         
 
         # decision finished
@@ -306,7 +309,8 @@ class DatastoreBackend(Backend):
 
         # find queued decision tasks (that haven't timed out)
         try:
-            sd = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)), key=lambda sa: sa['dt'])
+            sd = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)), key=lambda d: d['dt'])
+            sd = filter(lambda d: d['start']<= datetime.now(), sd)
             if not sd:
                 return None
 
