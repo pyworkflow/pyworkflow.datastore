@@ -85,11 +85,14 @@ class DatastoreBackend(Backend):
             self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(a['run_id']))
 
     def _schedule_decision(self, process, start=None, timer=None):
-        existing = self.datastore.get(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
-        if not existing:
+        existing = self.datastore.get(self.KEY_SCHEDULED_DECISIONS.child(process['pid'])) or []
+        matching = filter(lambda a: not start or not a['start'] or a['start'] <= start, existing)
+
+        if not matching:
             expiration = datetime.now() + timedelta(seconds=self.workflows[process['proc'].workflow]['decision_timeout'])
             timer = pickle.dumps(timer) if timer else None
-            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), {'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start, 'timer': timer})
+            new_val = existing + [{'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start, 'timer': timer}]
+            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), new_val)
 
     def _cancel_decision(self, process):
         self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
@@ -200,9 +203,9 @@ class DatastoreBackend(Backend):
                 if managed_process['proc'].parent:
                     parent = self._managed_process(managed_process['proc'].parent)
                     if decision.type == 'complete_process':
-                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCompleted(result=decision.result)))
+                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCompleted(result=decision.result), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
                     elif decision.type == 'cancel_process':
-                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details, reason=decision.reason)))
+                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details, reason=decision.reason), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
 
                     self._save_managed_process(parent)
                     self._schedule_decision(parent)
@@ -310,12 +313,21 @@ class DatastoreBackend(Backend):
 
         # find queued decision tasks (that haven't timed out)
         try:
-            sd = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)), key=lambda d: d['dt'])
+
+            all_decisions = [x for d_list in self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)) for x in d_list]
+            sd = sorted(all_decisions, key=lambda d: d['dt'])
             sd = filter(lambda d: d['start'] is None or d['start'] <= datetime.now(), sd)
             if not sd:
                 return None
 
-            self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']))
+            p_decisions = [x for x in sd[1:] if x['pid'] == sd[0]['pid']]
+            if not p_decisions:
+                # no more decisions for this process
+                self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']))
+            else:
+                # some other decisions for this process left at later time
+                self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']), p_decisions)
+
             (pid, expiration, timer) = (sd[0]['pid'], sd[0]['exp'], sd[0]['timer'])
         except:
             return None
