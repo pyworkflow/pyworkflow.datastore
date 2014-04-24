@@ -47,21 +47,18 @@ class DatastoreBackend(Backend):
         return {'pid': process['pid'], 'proc': pickle.loads(process['proc'])}
 
     def _managed_process(self, process_or_pid):
-        if isinstance(process_or_pid, basestring):
-            match = lambda p: p['pid'] == process_or_pid
-        else:
-            match = lambda p: p['proc'].id == process_or_pid.id
-
-        unpickled = map(lambda x: self._unpickle_process(x), self.datastore.query(Query(self.KEY_RUNNING_PROCESSES)))
-        
-        managed_process = filter(match, unpickled)
-        if not managed_process:
+        pid = process_or_pid if isinstance(process_or_pid, basestring) else process_or_pid.id
+        match = self.datastore.get(self.KEY_RUNNING_PROCESSES.child(pid))
+        if not match:
             raise UnknownProcessException()
         
-        return managed_process[0]
+        unpickled = self._unpickle_process(match)
+        return unpickled
 
     def _save_managed_process(self, process):
-        self.datastore.put(self.KEY_RUNNING_PROCESSES.child(process['pid']), self._pickle_process(process))
+        pickled = self._pickle_process(process)
+        self.datastore.put(self.KEY_RUNNING_PROCESSES.child(process['pid']), pickled)
+        
 
     def _schedule_activity(self, process, activity, id, input):
         expiration = datetime.now() + timedelta(seconds=self.activities[activity]['scheduled_timeout'])
@@ -86,7 +83,7 @@ class DatastoreBackend(Backend):
 
     def _schedule_decision(self, process, start=None, timer=None):
         existing = self.datastore.get(self.KEY_SCHEDULED_DECISIONS.child(process['pid'])) or []
-        matching = filter(lambda a: not start or not a['start'] or a['start'] <= start, existing)
+        matching = filter(lambda a: not a['start'] or a['start'] <= (start or datetime.now()), existing)
 
         if not matching:
             expiration = datetime.now() + timedelta(seconds=self.workflows[process['proc'].workflow]['decision_timeout'])
@@ -213,10 +210,10 @@ class DatastoreBackend(Backend):
             # start child process
             if isinstance(decision, StartChildProcess):
                 process = Process(workflow=decision.process.workflow, id=decision.process.id or str(uuid4()), input=decision.process.input, tags=decision.process.tags, parent=task.process.id)
-                managed_process = {'pid': process.id, 'proc': process}
-                self._save_managed_process(managed_process)
+                child_process = {'pid': process.id, 'proc': process}
+                self._save_managed_process(child_process)
                 # schedule a decision
-                self._schedule_decision(managed_process)
+                self._schedule_decision(child_process)
 
             if isinstance(decision, Timer):
                 self._schedule_decision(managed_process, start=datetime.now() + timedelta(seconds=decision.delay), timer=decision)
@@ -285,18 +282,30 @@ class DatastoreBackend(Backend):
         # find queued activity tasks (that haven't timed out)
         self._time_out_activities()
 
-        try:
-            sa = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_ACTIVITIES)), key=lambda sa: sa['dt'])
-            if not sa:
+        def next_scheduled():
+            try:
+                sa = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_ACTIVITIES)), key=lambda sa: sa['dt'])
+                if not sa:
+                    return None
+
+                self.datastore.delete(self.KEY_SCHEDULED_ACTIVITIES.child(sa[0]['aid']))
+                return (sa[0]['pid'], pickle.loads(sa[0]['exec']), sa[0]['exp'])
+            except:
                 return None
 
-            self.datastore.delete(self.KEY_SCHEDULED_ACTIVITIES.child(sa[0]['aid']))
-            (pid, activity_execution, expiration) = (sa[0]['pid'], pickle.loads(sa[0]['exec']), sa[0]['exp'])
-        except:
-            return None
-        
-        run_id = str(uuid4())
-        managed_process = self._managed_process(pid)
+        while True:
+            scheduled = next_scheduled()
+            if scheduled:
+                (pid, activity_execution, expiration) = scheduled
+                run_id = str(uuid4())
+                try:
+                    managed_process = self._managed_process(pid)
+                    break
+                except UnknownProcessException:
+                    pass
+            else:
+                return None
+
         expiration = datetime.now() + timedelta(seconds=self.activities[activity_execution.activity]['execution_timeout'])
         heartbeat_expiration = datetime.now() + timedelta(seconds=self.activities[activity_execution.activity]['heartbeat_timeout'])
 
