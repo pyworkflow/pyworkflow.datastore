@@ -4,6 +4,7 @@ __email__ = 'willem.bult@gmail.com'
 
 import pickle
 import time
+import random
 
 from itertools import ifilter, imap
 from collections import deque
@@ -28,11 +29,32 @@ class DatastoreBackend(Backend):
     '''
 
     KEY_RUNNING_PROCESSES = Key('/processes/running')
+    KEY_LOCKED_PROCESSES = Key('/processes/locked')
     KEY_RUNNING_ACTIVITIES = Key('/activities/running')
     KEY_RUNNING_DECISIONS = Key('/decisions/running')
 
     KEY_SCHEDULED_DECISIONS = Key('/decisions/scheduled')
     KEY_SCHEDULED_ACTIVITIES = Key('/activities/scheduled')
+
+
+    class SyncedProcess:
+        def __init__(self, backend, pid, autosave):
+            self.backend = backend
+            self.pid = pid
+            self.autosave = autosave
+
+        def __enter__(self):
+            self.backend._lock_process(self.pid)
+            self.process = self.backend._managed_process(self.pid)
+            return self.process
+
+        def __exit__(self, *args):
+            if self.autosave:
+                self.backend._save_managed_process(self.process)
+            self.backend._unlock_process(self.pid)            
+
+    def synced_process(self, pid, autosave=True):
+        return self.SyncedProcess(self, pid, autosave=autosave)
 
     def __init__(self, datastore):
         self.workflows = {}
@@ -46,6 +68,23 @@ class DatastoreBackend(Backend):
     def _unpickle_process(self, process):
         return {'pid': process['pid'], 'proc': pickle.loads(process['proc'])}
 
+    def _lock_process(self, pid):
+        key = str(uuid4())
+        lock_idx = self.KEY_LOCKED_PROCESSES.child(pid)
+
+        while True:
+            lock = self.datastore.get(lock_idx)
+            if lock is None:
+                self.datastore.put(lock_idx, key)
+                lock = self.datastore.get(lock_idx)
+            if lock == key:
+                break
+            time.sleep(random.random() * .5)
+
+    def _unlock_process(self, pid):
+        lock_idx = self.KEY_LOCKED_PROCESSES.child(pid)
+        self.datastore.delete(lock_idx)
+
     def _managed_process(self, process_or_pid):
         pid = process_or_pid if isinstance(process_or_pid, basestring) else process_or_pid.id
         match = self.datastore.get(self.KEY_RUNNING_PROCESSES.child(pid))
@@ -57,8 +96,7 @@ class DatastoreBackend(Backend):
 
     def _save_managed_process(self, process):
         pickled = self._pickle_process(process)
-        self.datastore.put(self.KEY_RUNNING_PROCESSES.child(process['pid']), pickled)
-        
+        self.datastore.put(self.KEY_RUNNING_PROCESSES.child(process['pid']), pickled)        
 
     def _schedule_activity(self, process, activity, id, input):
         expiration = datetime.now() + timedelta(seconds=self.activities[activity]['scheduled_timeout'])
@@ -125,23 +163,19 @@ class DatastoreBackend(Backend):
         
     def signal_process(self, process, signal, data=None):
         # find the process as we know it
-        managed_process = self._managed_process(process)
-        
-        # append the signal event
-        managed_process['proc'].history.append(SignalEvent(Signal(signal, data)))
-        self._save_managed_process(managed_process)
+        with self.synced_process(process.id) as managed_process:
+            # append the signal event
+            managed_process['proc'].history.append(SignalEvent(Signal(signal, data)))
 
         # schedule a decision (if needed)
         self._schedule_decision(managed_process)
 
     def cancel_process(self, process, details=None, reason=None):
         # find the process as we know it
-        managed_process = self._managed_process(process)
-
-        # append the cancelation event
-        managed_process['proc'].history.append(DecisionEvent(CancelProcess(details=details, reason=reason)))
-        self._save_managed_process(managed_process)
-
+        with self.synced_process(process.id) as managed_process:
+            # append the cancelation event
+            managed_process['proc'].history.append(DecisionEvent(CancelProcess(details=details, reason=reason)))
+        
         # remove scheduled decision
         self._cancel_decision(managed_process)
 
@@ -174,50 +208,50 @@ class DatastoreBackend(Backend):
 
         self.datastore.delete(self.KEY_RUNNING_DECISIONS.child(task.context['run_id']))
         (pid, expiration) = (decision['pid'], decision['exp'])
-        managed_process = self._managed_process(pid)
 
-        # append the decision events
-        for decision in decisions:
-            managed_process['proc'].history.append(DecisionEvent(decision))
-            self._save_managed_process(managed_process)
-            
-            # schedule activity if needed
-            if hasattr(decision, 'activity'):
-                self._schedule_activity(managed_process, decision.activity, decision.id, decision.input)
+        with self.synced_process(pid, autosave=False) as managed_process:
 
-            # cancel activity
-            if isinstance(decision, CancelActivity):
-                activity = self._activity_by_id(decision.id)
-                self._cancel_activity(decision.id)
-                managed_process['proc'].history.append(ActivityEvent(pickle.loads(activity['exec']), ActivityCanceled()))
+            # append the decision events
+            for decision in decisions:
+                managed_process['proc'].history.append(DecisionEvent(decision))
                 self._save_managed_process(managed_process)
+                
+                # schedule activity if needed
+                if hasattr(decision, 'activity'):
+                    self._schedule_activity(managed_process, decision.activity, decision.id, decision.input)
 
-            # complete process
-            if isinstance(decision, CompleteProcess) or isinstance(decision, CancelProcess):
-                for mp in filter(lambda mp: mp['pid'] == pid, self.datastore.query(Query(self.KEY_RUNNING_PROCESSES))):
-                    self.datastore.delete(self.KEY_RUNNING_PROCESSES.child(mp['pid']))
-                self._cancel_decision(managed_process)
-                if managed_process['proc'].parent:
-                    parent = self._managed_process(managed_process['proc'].parent)
-                    if decision.type == 'complete_process':
-                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCompleted(result=decision.result), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
-                    elif decision.type == 'cancel_process':
-                        parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details, reason=decision.reason), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
+                # cancel activity
+                if isinstance(decision, CancelActivity):
+                    activity = self._activity_by_id(decision.id)
+                    self._cancel_activity(decision.id)
+                    managed_process['proc'].history.append(ActivityEvent(pickle.loads(activity['exec']), ActivityCanceled()))
+                    self._save_managed_process(managed_process)
 
-                    self._save_managed_process(parent)
-                    self._schedule_decision(parent)
+                # complete process
+                if isinstance(decision, CompleteProcess) or isinstance(decision, CancelProcess):
+                    for mp in filter(lambda mp: mp['pid'] == pid, self.datastore.query(Query(self.KEY_RUNNING_PROCESSES))):
+                        self.datastore.delete(self.KEY_RUNNING_PROCESSES.child(mp['pid']))
+                    self._cancel_decision(managed_process)
+                    if managed_process['proc'].parent:
+                        parent = self._managed_process(managed_process['proc'].parent)
+                        if decision.type == 'complete_process':
+                            parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCompleted(result=decision.result), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
+                        elif decision.type == 'cancel_process':
+                            parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details, reason=decision.reason), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
 
-            # start child process
-            if isinstance(decision, StartChildProcess):
-                process = Process(workflow=decision.process.workflow, id=decision.process.id or str(uuid4()), input=decision.process.input, tags=decision.process.tags, parent=task.process.id)
-                child_process = {'pid': process.id, 'proc': process}
-                self._save_managed_process(child_process)
-                # schedule a decision
-                self._schedule_decision(child_process)
+                        self._save_managed_process(parent)
+                        self._schedule_decision(parent)
 
-            if isinstance(decision, Timer):
-                self._schedule_decision(managed_process, start=datetime.now() + timedelta(seconds=decision.delay), timer=decision)
-        
+                # start child process
+                if isinstance(decision, StartChildProcess):
+                    process = Process(workflow=decision.process.workflow, id=decision.process.id or str(uuid4()), input=decision.process.input, tags=decision.process.tags, parent=task.process.id)
+                    child_process = {'pid': process.id, 'proc': process}
+                    self._save_managed_process(child_process)
+                    # schedule a decision
+                    self._schedule_decision(child_process)
+
+                if isinstance(decision, Timer):
+                    self._schedule_decision(managed_process, start=datetime.now() + timedelta(seconds=decision.delay), timer=decision)
 
         # decision finished
         self.datastore.delete(self.KEY_RUNNING_DECISIONS.child(task.context['run_id']))
@@ -232,11 +266,10 @@ class DatastoreBackend(Backend):
 
         self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(task.context['run_id']))
         (execution, pid, expiration, heartbeat_expiration) = (pickle.loads(activity['exec']), activity['pid'], activity['exp'], activity['hb_exp'])
-        managed_process = self._managed_process(pid)
-
-        # append the activity event
-        managed_process['proc'].history.append(ActivityEvent(execution, result))
-        self._save_managed_process(managed_process)
+        
+        with self.synced_process(pid) as managed_process:
+            # append the activity event
+            managed_process['proc'].history.append(ActivityEvent(execution, result))
 
         # schedule a decision (if needed)
         self._schedule_decision(managed_process)
@@ -256,9 +289,9 @@ class DatastoreBackend(Backend):
         for expired in filter(lambda a: a['exp'] < datetime.now(), self.datastore.query(Query(self.KEY_SCHEDULED_ACTIVITIES))):
             self.datastore.delete(self.KEY_SCHEDULED_ACTIVITIES.child(expired['aid']))
 
-            managed_process = self._managed_process(expired['pid'])
-            managed_process['proc'].history.append(ActivityEvent(pickle.loads(expired['exec']), ActivityTimedOut()))
-            self._save_managed_process(managed_process)
+            pid = expired['pid']
+            with self.synced_process(pid) as managed_process:
+                managed_process['proc'].history.append(ActivityEvent(pickle.loads(expired['exec']), ActivityTimedOut()))
             
             self._schedule_decision(managed_process)
             
@@ -266,10 +299,10 @@ class DatastoreBackend(Backend):
         for expired in filter(lambda a: a['exp'] < datetime.now() or a['hb_exp'] < datetime.now(), self.datastore.query(Query(self.KEY_RUNNING_ACTIVITIES))):
             self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(expired['run_id']))
 
-            managed_process = self._managed_process(expired['pid'])
-            managed_process['proc'].history.append(ActivityEvent(pickle.loads(expired['exec']), ActivityTimedOut()))
-            self._save_managed_process(managed_process)
-
+            pid = expired['pid']
+            with self.synced_process(pid) as managed_process:
+                managed_process['proc'].history.append(ActivityEvent(pickle.loads(expired['exec']), ActivityTimedOut()))
+            
             self._schedule_decision(managed_process)
 
     def _time_out_decisions(self):
@@ -299,21 +332,20 @@ class DatastoreBackend(Backend):
                 (pid, activity_execution, expiration) = scheduled
                 run_id = str(uuid4())
                 try:
-                    managed_process = self._managed_process(pid)
-                    break
+                    with self.synced_process(pid) as managed_process:
+                        expiration = datetime.now() + timedelta(seconds=self.activities[activity_execution.activity]['execution_timeout'])
+                        heartbeat_expiration = datetime.now() + timedelta(seconds=self.activities[activity_execution.activity]['heartbeat_timeout'])
+
+                        managed_process['proc'].history.append(ActivityStartedEvent(activity_execution))
+
+                        self.datastore.put(self.KEY_RUNNING_ACTIVITIES.child(run_id), {'run_id': run_id, 'exec': pickle.dumps(activity_execution), 'pid': pid, 'exp': expiration, 'hb_exp': heartbeat_expiration})
+                        return ActivityTask(activity_execution, process_id=pid, context={'run_id': run_id})
+
                 except UnknownProcessException:
                     pass
             else:
                 return None
 
-        expiration = datetime.now() + timedelta(seconds=self.activities[activity_execution.activity]['execution_timeout'])
-        heartbeat_expiration = datetime.now() + timedelta(seconds=self.activities[activity_execution.activity]['heartbeat_timeout'])
-
-        managed_process['proc'].history.append(ActivityStartedEvent(activity_execution))
-        self._save_managed_process(managed_process)
-
-        self.datastore.put(self.KEY_RUNNING_ACTIVITIES.child(run_id), {'run_id': run_id, 'exec': pickle.dumps(activity_execution), 'pid': pid, 'exp': expiration, 'hb_exp': heartbeat_expiration})
-        return ActivityTask(activity_execution, process_id=pid, context={'run_id': run_id})
 
     def poll_decision_task(self, identity=None):
         # time-out expired activities
@@ -342,13 +374,12 @@ class DatastoreBackend(Backend):
             return None
 
         run_id = str(uuid4())
-        managed_process = self._managed_process(pid)
+        with self.synced_process(pid) as managed_process:
 
-        if timer:
-            managed_process['proc'].history.append(TimerEvent(pickle.loads(timer)))
-        
-        managed_process['proc'].history.append(DecisionStartedEvent())
-        self._save_managed_process(managed_process)
+            if timer:
+                managed_process['proc'].history.append(TimerEvent(pickle.loads(timer)))
+            
+            managed_process['proc'].history.append(DecisionStartedEvent())
 
         process = managed_process['proc']
         
