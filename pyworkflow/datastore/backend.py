@@ -346,7 +346,9 @@ class DatastoreBackend(Backend):
 
         if timer:
             managed_process['proc'].history.append(TimerEvent(pickle.loads(timer)))
-            self._save_managed_process(managed_process)
+        
+        managed_process['proc'].history.append(DecisionStartedEvent())
+        self._save_managed_process(managed_process)
 
         process = managed_process['proc']
         
