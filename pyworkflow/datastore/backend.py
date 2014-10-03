@@ -170,11 +170,11 @@ class DatastoreBackend(Backend):
         # schedule a decision (if needed)
         self._schedule_decision(managed_process)
 
-    def cancel_process(self, process, details=None, reason=None):
+    def cancel_process(self, process, details=None):
         # find the process as we know it
         with self.synced_process(process.id) as managed_process:
             # append the cancelation event
-            managed_process['proc'].history.append(DecisionEvent(CancelProcess(details=details, reason=reason)))
+            managed_process['proc'].history.append(DecisionEvent(CancelProcess(details=details)))
         
         # remove scheduled decision
         self._cancel_decision(managed_process)
@@ -237,7 +237,7 @@ class DatastoreBackend(Backend):
                         if decision.type == 'complete_process':
                             parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCompleted(result=decision.result), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
                         elif decision.type == 'cancel_process':
-                            parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details, reason=decision.reason), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
+                            parent['proc'].history.append(ChildProcessEvent(managed_process['pid'], ProcessCanceled(details=decision.details), workflow=managed_process['proc'].workflow, tags=managed_process['proc'].tags))
 
                         self._save_managed_process(parent)
                         self._schedule_decision(parent)
