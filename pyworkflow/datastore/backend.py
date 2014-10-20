@@ -163,7 +163,7 @@ class DatastoreBackend(Backend):
         
     def signal_process(self, process, signal, data=None):
         # find the process as we know it
-        with self.synced_process(process.id) as managed_process:
+        with self.synced_process(getattr(process, 'id', process)) as managed_process:
             # append the signal event
             managed_process['proc'].history.append(SignalEvent(Signal(signal, data)))
 
@@ -172,7 +172,7 @@ class DatastoreBackend(Backend):
 
     def cancel_process(self, process, details=None):
         # find the process as we know it
-        with self.synced_process(process.id) as managed_process:
+        with self.synced_process(getattr(process, 'id', process)) as managed_process:
             # append the cancelation event
             managed_process['proc'].history.append(DecisionEvent(CancelProcess(details=details)))
         
