@@ -374,13 +374,15 @@ class DatastoreBackend(Backend):
             if not sd:
                 return None
 
+            key = self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid'])
             p_decisions = [x for x in sd[1:] if x['pid'] == sd[0]['pid']]
             if not p_decisions:
                 # no more decisions for this process
-                self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']))
+                self.datastore.delete(key)
             else:
                 # some other decisions for this process left at later time
-                self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(sd[0]['pid']), p_decisions)
+                updated = {'key': str(key), 'category': category, 'decisions': p_decisions}
+                self.datastore.put(key, updated)
 
             (pid, expiration, timer) = (sd[0]['pid'], sd[0]['exp'], sd[0]['timer'])
         except:
