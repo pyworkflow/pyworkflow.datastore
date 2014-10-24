@@ -98,11 +98,14 @@ class DatastoreBackend(Backend):
         pickled = self._pickle_process(process)
         self.datastore.put(self.KEY_RUNNING_PROCESSES.child(process['pid']), pickled)        
 
-    def _schedule_activity(self, process, activity, id, input):
+    def _schedule_activity(self, process, activity, id, input, category=None):
         expiration = datetime.now() + timedelta(seconds=self.activities[activity]['scheduled_timeout'])
         execution = ActivityExecution(activity, id, input=input)
         aid = str(uuid4())
-        self.datastore.put(self.KEY_SCHEDULED_ACTIVITIES.child(aid), {'dt': time.time(), 'aid': aid, 'exec': pickle.dumps(execution), 'pid': process['pid'], 'exp': expiration})
+        category = category or self.activities[activity]['category']
+        key = self.KEY_SCHEDULED_ACTIVITIES.child(aid)
+        obj = {'key': str(key), 'dt': time.time(), 'aid': aid, 'exec': pickle.dumps(execution), 'pid': process['pid'], 'exp': expiration, 'category': str(category)}
+        self.datastore.put(key, obj)
 
     def _activity_by_id(self, id):
         activity = filter(lambda a: pickle.loads(a['exec']).id == id, self.datastore.query(Query(self.KEY_RUNNING_ACTIVITIES)))
@@ -218,7 +221,7 @@ class DatastoreBackend(Backend):
                 
                 # schedule activity if needed
                 if hasattr(decision, 'activity'):
-                    self._schedule_activity(managed_process, decision.activity, decision.id, decision.input)
+                    self._schedule_activity(managed_process, decision.activity, decision.id, decision.input, category=decision.category)
 
                 # cancel activity
                 if isinstance(decision, CancelActivity):
@@ -311,13 +314,14 @@ class DatastoreBackend(Backend):
             self.datastore.delete(self.KEY_RUNNING_DECISIONS.child(expired['run_id']))
             self._schedule_decision(self._managed_process(expired['pid']))
 
-    def poll_activity_task(self, category="default", identity=None):
+    def poll_activity_task(self, category=Defaults.ACTIVITY_CATEGORY, identity=None):
         # find queued activity tasks (that haven't timed out)
         self._time_out_activities()
 
         def next_scheduled():
             try:
-                sa = sorted(self.datastore.query(Query(self.KEY_SCHEDULED_ACTIVITIES)), key=lambda sa: sa['dt'])
+                q = Query(self.KEY_SCHEDULED_ACTIVITIES).filter('category','=',str(category))
+                sa = sorted(self.datastore.query(q), key=lambda sa: sa['dt'])
                 if not sa:
                     return None
 
