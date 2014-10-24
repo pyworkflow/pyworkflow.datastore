@@ -123,22 +123,31 @@ class DatastoreBackend(Backend):
             self.datastore.delete(self.KEY_RUNNING_ACTIVITIES.child(a['run_id']))
 
     def _schedule_decision(self, process, start=None, timer=None):
-        existing = self.datastore.get(self.KEY_SCHEDULED_DECISIONS.child(process['pid'])) or []
-        matching = filter(lambda a: not a['start'] or a['start'] <= (start or datetime.now()), existing)
+        workflow = self.workflows[process['proc'].workflow]
+        category = workflow['category']
 
+        key = self.KEY_SCHEDULED_DECISIONS.child(process['pid'])
+        val = self.datastore.get(key) or {'key': str(key), 'category': category, 'decisions': []}
+        matching = filter(lambda a: not a['start'] or a['start'] <= (start or datetime.now()), val['decisions'])
+        
         if not matching:
-            expiration = datetime.now() + timedelta(seconds=self.workflows[process['proc'].workflow]['decision_timeout'])
+            expiration = datetime.now() + timedelta(seconds=workflow['decision_timeout'])
             timer = pickle.dumps(timer) if timer else None
-            new_val = existing + [{'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start, 'timer': timer}]
-            self.datastore.put(self.KEY_SCHEDULED_DECISIONS.child(process['pid']), new_val)
+            new_obj = {'dt': time.time(), 'pid': process['pid'], 'exp': expiration, 'start': start, 'timer': timer}
+            val['decisions'].append(new_obj)            
+            self.datastore.put(key, val)
 
     def _cancel_decision(self, process):
         self.datastore.delete(self.KEY_SCHEDULED_DECISIONS.child(process['pid']))
 
-    def register_workflow(self, name, timeout=Defaults.WORKFLOW_TIMEOUT, decision_timeout=Defaults.DECISION_TIMEOUT):
+    def register_workflow(self, name, category=Defaults.DECISION_CATEGORY,
+        timeout=Defaults.WORKFLOW_TIMEOUT, 
+        decision_timeout=Defaults.DECISION_TIMEOUT):
+
         self.workflows[name] = {
             'timeout': timeout,
-            'decision_timeout': decision_timeout
+            'decision_timeout': decision_timeout,
+            'category': category
         }
 
     def register_activity(self, name, category=Defaults.ACTIVITY_CATEGORY, 
@@ -351,15 +360,15 @@ class DatastoreBackend(Backend):
                 return None
 
 
-    def poll_decision_task(self, identity=None):
+    def poll_decision_task(self, category=Defaults.DECISION_CATEGORY, identity=None):
         # time-out expired activities
         self._time_out_activities()
         self._time_out_decisions()
 
         # find queued decision tasks (that haven't timed out)
         try:
-
-            all_decisions = [x for d_list in self.datastore.query(Query(self.KEY_SCHEDULED_DECISIONS)) for x in d_list]
+            q = Query(self.KEY_SCHEDULED_DECISIONS).filter('category','=',category)
+            all_decisions = [x for obj in self.datastore.query(q) for x in obj['decisions']]
             sd = sorted(all_decisions, key=lambda d: d['dt'])
             sd = filter(lambda d: d['start'] is None or d['start'] <= datetime.now(), sd)
             if not sd:
