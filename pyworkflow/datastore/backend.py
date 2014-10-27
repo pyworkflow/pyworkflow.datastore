@@ -172,6 +172,8 @@ class DatastoreBackend(Backend):
 
         # schedule a decision
         self._schedule_decision(managed_process)
+
+        return process.id
         
     def signal_process(self, process, signal, data=None):
         # find the process as we know it
